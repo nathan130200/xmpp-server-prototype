@@ -10,7 +10,7 @@ from xmpp import Jid, Parser, XmppElement, get_start_tag, switch_direction, to_x
 
 class Session:
     def __init__(self, socket: socket, addr):
-        self.session_id = uuid4()
+        self.session_id = str(uuid4())
         print(f"-- session opened: {self.session_id}")
         
         self._authenticated = False
@@ -28,7 +28,8 @@ class Session:
         self._parser = Parser(self, "UTF-8")
         self._sendQueue = Queue()
 
-    def start(self):
+    def start(self, close_cb):
+        self._close_cb = close_cb
         self._sendThread.start()
         self._receiveThread.start()
 
@@ -42,35 +43,50 @@ class Session:
         t = Thread(target=self._on_stop,daemon=True)
         t.start()
 
+        self._close_cb(self)
+
     def _on_stop(self):
+        # Ensure all data is sent
         while not self._sendQueue.empty():
-            sleep(0.1)
+            sleep(0.5)
 
         self._writable = False
+        self._socket.close()
 
     def _on_receive(self):
-        while self._isOpen:
+        try:
+            while self._isOpen:
 
-            if not self._readable:
-                sleep(0.1)
-                continue
+                if not self._readable:
+                    sleep(0.1)
+                    continue
 
-            buf = self._socket.recv(256)
-            size = len(buf)
+                # Set default buffer size for parsing context
+                buf = self._socket.recv(4096)
+                size = len(buf)
 
-            if size <= 0:
-                print("client closed")
-                break
+                if size <= 0:
+                    break
 
-            if not self._parser.write(buf, False):
-                print("parser error")
-                break
+                if not self._parser.write(buf, False):
+                    break
+        except Exception as err:
+            print(f"RECV failed:\n{err}\n")
+        finally:
+            # ensure we really closed the session
+            self.stop()
 
     def _on_send(self):
-        while self._writable != 0:
-            item = self._sendQueue.get()
-            self._socket.send(item)
-            sleep(0.1)
+        try:
+            while self._writable != 0:
+                item = self._sendQueue.get()
+                self._socket.send(item)
+                sleep(0.1)
+        except Exception as err:
+            print(f"SEND failed:\n{err}\n")
+        finally:
+            # ensure we really closed the session
+            self.stop()
 
     def handle_stream_start(self, e: et.Element):
         features = XmppElement("stream:features")
@@ -84,13 +100,17 @@ class Session:
 
             features.append(mechanisms)
         else:
-            features.append(et.Element("bind", {"xmlns":"urn:ietf:params:xml:ns:xmpp-bind"}))
+            if self._jid.resource == None:
+                features.append(et.Element("bind", {"xmlns":"urn:ietf:params:xml:ns:xmpp-bind"}))
+
             features.append(et.Element("session", {"xmlns":"urn:ietf:params:xml:ns:xmpp-session"}))
 
-        del e.attrib["to"]
+        switch_direction(e)
+        e.attrib["id"] = self.session_id
         e.attrib["from"] = self._jid.domain
-        self.send(get_start_tag(e))
-        self.send(to_xml_string(features))
+
+        # Its okay to send stream header + features, reduces amount of calls to send data.
+        self.send(get_start_tag(e) + to_xml_string(features))
 
     def send(self, xml: bytes | str):
         s = None
@@ -105,7 +125,9 @@ class Session:
         self._sendQueue.put(bytes(s, "UTF-8"), False)
 
     def handle_stream_end(self):
-        print(f"recv <<\n</stream:stream>\n")
+        xml = "</stream:stream>"
+        self.send(xml)
+        print(f"recv <<\n{xml}\n")
         self.stop()
         pass
 
@@ -117,9 +139,12 @@ class Session:
 
             if len(sasl) == 3:
                 user = sasl[1]
+                pwd = sasl[2]
             else:
                 user = sasl[0]
+                pwd = sasl[1]
 
+            # check user & pwd in DB
             self._jid.local = user
 
             self.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl' />")
@@ -132,6 +157,7 @@ class Session:
 
                 switch_direction(e)
 
+                # TODO: Handle resource bind conflict?
                 resource = query.find('./resource')
                 self._jid.resource = resource.text or "GameClient"
                 query.remove(resource)
@@ -148,14 +174,14 @@ class Session:
                 self.send(e)
 
 
-
-
-
 server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
 server.bind(("0.0.0.0", 5222))
 server.listen(10)
 
 sessions: list[Session] = []
+
+def on_close_callback(s: Session):
+    sessions.remove(s)
 
 while True:
     sleep(0.1)
@@ -166,5 +192,5 @@ while True:
         continue
 
     s = Session(client, addr)
-    s.start()
+    s.start(on_close_callback)
     sessions.append(s)

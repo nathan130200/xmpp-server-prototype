@@ -85,14 +85,12 @@ class Parser:
             self.is_cdata = False
 
         def on_text(value):
-
-            if self._current != None:
-                if self._current.text == None:
-                    self._current.text = value
-                else:
-                    self._current.text += value
-
-            pass
+            if not self.is_cdata:
+                if self._current != None:
+                    if self._current.text == None:
+                        self._current.text = value
+                    else:
+                        self._current.text += value
 
         def on_element_start(name:str, attrs: dict[str, str]):
             el = XmppElement(name, attrs)
